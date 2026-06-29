@@ -55,6 +55,23 @@ Every `npm install` is a trust decision you make blind:
 
 `shouldi` answers all of that **before** you commit, straight from the npm registry. No install. No `node_modules`. No dependencies of its own.
 
+## Real CVEs — not guesses
+
+`shouldi` checks every resolved package against npm's own advisory database (the same data `npm audit` uses) and matches the exact vulnerable version ranges across the **whole tree** — transitive deps included. No Snyk account, no AI that might hallucinate a CVE, no token.
+
+```sh
+npx shouldi lodash@4.17.4
+```
+```
+  🛡  10 known vulnerabilities (1 critical, 4 high, 5 moderate)
+     [critical] lodash@4.17.4 Prototype Pollution in lodash
+     [high]     lodash@4.17.4 Command Injection in lodash
+  ──────────────────────────────────────────────
+  GRADE  F   "5 serious known vulnerabilities in the tree (1 critical, 4 high) — patch or avoid."
+```
+
+A critical CVE alone forces an **F** (exit 2), so it gates CI. Install a patched range and the card goes green.
+
 ## The killer feature: it shows you the actual install script
 
 Other tools tell you a package *has* an install script. `shouldi` shows you **the exact command that will run on your machine** — and flags it if it reaches the network, pipes to a shell, evals, or reads your env.
@@ -122,6 +139,7 @@ npx shouldi "$NEW_DEP" || exit 1
 
 Starts at 100, loses points for:
 
+- **known CVEs** — critical −25, high −12, moderate −4, low −1 (from npm's advisory data, matched across the whole tree). A single critical forces **F**.
 - **flagged install scripts** (up to −40 each) — scaled by how many danger signals one command trips (network, pipe-to-shell, eval…). This is the only thing that can sink a package to **F on its own** — danger, not size.
 - **install scripts** (−5 each) — benign native builds are a mild nudge, not a death sentence
 - **deprecated packages** (−5 each)
@@ -145,6 +163,23 @@ Zero runtime dependencies. Node 18+.
 ```sh
 npm i -g shouldi
 ```
+
+## How it compares
+
+|  | **shouldi** | npq | should-install | howfat |
+| --- | :---: | :---: | :---: | :---: |
+| Real CVEs (npm advisories) | ✅ | via Snyk | AI-guessed | ❌ |
+| Shows the literal install-script command | ✅ | ❌ (warns only) | ❌ | ❌ |
+| Install-script danger scan (network/eval/…) | ✅ | ❌ | ❌ | ❌ |
+| npm-accurate dependency resolution | ✅ | n/a | n/a | ✅ |
+| Whole-project audit + letter grade | ✅ | ❌ | ✅ (AI) | ❌ |
+| Maintainers / staleness signals | ✅ | partial | ✅ | ❌ |
+| Runtime dependencies | **0** | 4 | 5 | 5 |
+| Needs an account / API key / AI CLI | **no** | Snyk optional | **yes (AI)** | no |
+| Deterministic (same answer every run) | ✅ | ✅ | ❌ | ✅ |
+| Changes your workflow | no (read-only) | yes (`npq install`) | no | no |
+
+`shouldi` is the only one that is **zero-dependency, needs nothing installed, and shows you the exact command an install script will run** — backed by real advisory data instead of an AI's best guess.
 
 ## License
 

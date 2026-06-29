@@ -218,6 +218,37 @@ async function fetchPackument(name, attempt = 0) {
   }
 }
 
+// Query npm's free bulk advisory endpoint (the same data `npm audit` uses — no
+// Snyk, no account, no AI) and attach matching CVEs to each resolved record.
+// Authoritative and deterministic: real vulnerable-version ranges, not guesses.
+async function fetchAdvisories(records) {
+  const payload = {};
+  for (const r of records) (payload[r.name] ||= new Set()).add(r.version);
+  for (const k of Object.keys(payload)) payload[k] = [...payload[k]];
+  let data = {};
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 15000);
+    const res = await fetch(`${REGISTRY}/-/npm/v1/security/advisories/bulk`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify(payload),
+      signal: ac.signal,
+    });
+    clearTimeout(timer);
+    if (res.ok) data = await res.json();
+  } catch {
+    /* advisory lookup is best-effort; the card still renders without it */
+  }
+  for (const r of records) {
+    const advs = data[r.name] || [];
+    r.vulns = advs
+      .filter((a) => satisfies(r.version, a.vulnerable_versions))
+      .map((a) => ({ severity: a.severity, title: a.title, url: a.url }));
+  }
+  return Object.keys(data).length > 0;
+}
+
 // pick the concrete version a spec resolves to, the way npm would: exact match,
 // dist-tag, or highest version satisfying a range. Non-semver specs
 // (git/url/workspace/file) fall back to latest.
@@ -314,10 +345,28 @@ function score(records, { excludeKey = null, asked = 1 } = {}) {
     if (!oldest || Date.parse(r.publishedAt) < Date.parse(oldest.publishedAt)) oldest = r;
   const stale = dated.filter((r) => now - Date.parse(r.publishedAt) > STALE_MS);
 
-  // Calibration: F is reserved for genuine danger (an install script that
-  // phones home / evals), not merely a big tree. Size/count/staleness are
-  // bloat signals and only nudge the grade; a flagged install script dominates.
+  // known CVEs across the resolved tree (from npm's advisory data)
+  const vulnList = records.flatMap((r) =>
+    (r.vulns || []).map((v) => ({ ...v, pkg: r.name, version: r.version }))
+  );
+  const sevCount = (sv) => vulnList.filter((v) => v.severity === sv).length;
+  const vulns = {
+    critical: sevCount("critical"),
+    high: sevCount("high"),
+    moderate: sevCount("moderate"),
+    low: sevCount("low"),
+    total: vulnList.length,
+    list: vulnList,
+  };
+
+  // Calibration: F is reserved for genuine danger — a known critical CVE or an
+  // install script that phones home / evals — not merely a big tree. Size,
+  // count, and staleness are bloat signals that only nudge the grade.
   let pts = 100;
+  pts -= Math.min(50, vulns.critical * 25); // a critical CVE alone can force F
+  pts -= Math.min(36, vulns.high * 12);
+  pts -= Math.min(16, vulns.moderate * 4);
+  pts -= Math.min(8, vulns.low * 1);
   pts -= Math.min(20, installScripts.length * 5); // benign native build = mild
   const dangerPenalty = dangerous.reduce((a, r) => a + Math.min(40, r.danger.length * 15), 0);
   pts -= Math.min(60, dangerPenalty); // the real threat — can sink to F alone
@@ -336,7 +385,12 @@ function score(records, { excludeKey = null, asked = 1 } = {}) {
   const oldestYears = oldest ? (now - Date.parse(oldest.publishedAt)) / YEAR_MS : 0;
 
   let quip;
-  if (dangerous.length)
+  if (vulns.critical || vulns.high) {
+    const n = vulns.critical + vulns.high;
+    const detail = [vulns.critical && vulns.critical + " critical", vulns.high && vulns.high + " high"].filter(Boolean).join(", ");
+    quip = `${n} serious known vulnerabilit${n > 1 ? "ies" : "y"} in the tree (${detail}) — patch or avoid.`;
+  }
+  else if (dangerous.length)
     quip = `an install script is flagged for ${dangerous[0].danger.join(", ")} — read the command above before you trust it.`;
   else if (installScripts.length)
     quip = `${installScripts.length} package${installScripts.length > 1 ? "s" : ""} run${installScripts.length > 1 ? "" : "s"} code on your machine at install — review before trusting.`;
@@ -347,7 +401,7 @@ function score(records, { excludeKey = null, asked = 1 } = {}) {
   else if (total <= 10) quip = "lean. safe to add.";
   else quip = "fine — typical for its size.";
 
-  return { total, names, size, installScripts, deprecated, direct, dangerous, maintainers, oldest, stale, asked, grade, quip, pts };
+  return { total, names, size, installScripts, deprecated, direct, dangerous, vulns, maintainers, oldest, stale, asked, grade, quip, pts };
 }
 
 // ===================== render =====================
@@ -369,6 +423,23 @@ function render({ subject, version, project }, s, errCount) {
   );
   out.push(`  👤 ${bold(String(s.maintainers))} maintainer${s.maintainers === 1 ? "" : "s"} you'd be trusting`);
   out.push(`  💾 ${bold(bytes(s.size))} on disk`);
+
+  if (s.vulns.total) {
+    const v = s.vulns;
+    const parts = [
+      v.critical && `${v.critical} critical`,
+      v.high && `${v.high} high`,
+      v.moderate && `${v.moderate} moderate`,
+      v.low && `${v.low} low`,
+    ].filter(Boolean);
+    out.push(`  ${red("🛡")}  ${bold(red(String(v.total)))} ${red(`known vulnerabilit${v.total > 1 ? "ies" : "y"} (${parts.join(", ")})`)}`);
+    const rank = { critical: 0, high: 1, moderate: 2, low: 3 };
+    const top = [...v.list].sort((a, b) => rank[a.severity] - rank[b.severity]).slice(0, 4);
+    for (const x of top)
+      out.push(`     ${red("[" + x.severity + "]")} ${dim(x.pkg + "@" + x.version)} ${x.title.slice(0, 52)}`);
+  } else {
+    out.push(`  ${green("✓")}  no known vulnerabilities`);
+  }
 
   if (s.installScripts.length) {
     const n = s.installScripts.length;
@@ -458,6 +529,7 @@ async function main() {
     const { records, errors } = await resolveSeeds(proj.seeds);
     clearSpinner();
     if (!records.length) { console.error(`\n  ${red("✗")} could not resolve dependencies\n`); return shutdown(1); }
+    await fetchAdvisories(records);
     const s = score(records, { asked: proj.seeds.length });
     render({ subject: proj.name, project: true }, s, errors.length);
     return shutdown(s.grade === "F" ? 2 : 0);
@@ -479,6 +551,7 @@ async function main() {
     console.error(`\n  ${red("✗")} could not resolve ${name}\n`);
     return shutdown(1);
   }
+  await fetchAdvisories(result.records);
   const root = result.records.find((r) => r.name === name && r.depth === 0);
   const s = score(result.records, { excludeKey: root && root.key, asked: 1 });
   render({ subject: name, version }, s, result.errors.length);
